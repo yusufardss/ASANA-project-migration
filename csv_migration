@@ -1,0 +1,612 @@
+import os
+import time
+import csv
+import difflib
+import requests
+import re
+from urllib.parse import urlparse
+from dataclasses import dataclass
+from enum import Enum
+from typing import Optional, Dict, Any, Tuple, Set, List
+
+# ========= KONFIGURASI WAJIB =========
+TOKEN_A = "2/1206278759530839/1211077736120079:2bed5ad552e10c3b312ace050e51e4a4"  # sumber (READ)
+TOKEN_B = "2/1210982884256465/1211077996672430:48d2cc32de62818fb37e7dc315c86a54"  # tujuan (WRITE)
+
+PROJECT_A = "1206687501771440"  # project di Akun A (sumber)
+PROJECT_B = "1211083587843704"  # project di Akun B (tujuan)
+
+# Pemetaan task (TOP-LEVEL): exact | fuzzy | csv
+MAPPING_CSV = None
+MATCH_MODE = "exact"
+FUZZY_CUTOFF = 0.85
+
+BASE_URL = "https://app.asana.com/api/1.0"
+H_A = {"Authorization": f"Bearer {TOKEN_A}"}
+H_B = {"Authorization": f"Bearer {TOKEN_B}"}
+
+# ========= PARAM UTIL & RETRY & LIMIT =========
+MAX_FILENAME_LEN = 180
+RETRY_STATUS = {429, 500, 502, 503, 504}
+
+# Batas upload Asana (~100MB); pakai ambang aman 95MB
+SAFE_UPLOAD_THRESHOLD = 95 * 1024 * 1024
+
+DOWNLOAD_TIMEOUT = 120
+UPLOAD_TIMEOUT = (30, 900)  # (connect, read)
+CHUNK_SIZE = 1024 * 1024 * 4  # 4MB
+
+# ========= FOLDER TEMP UNIK PER-RUN (tanpa env/PS) =========
+# RUN_ID diambil dari PROJECT_A/B + timestamp agar unik di setiap run
+RUN_ID = f"{PROJECT_A}_to_{PROJECT_B}_{time.strftime('%Y%m%d-%H%M%S')}"
+TMP_DIR = os.path.join("tmp_asana_attachments", RUN_ID)
+os.makedirs(TMP_DIR, exist_ok=True)
+
+print(f"[INFO] TMP_DIR untuk run ini: {TMP_DIR}")
+
+# ========= INVISIBLE TOKEN (ramah dibaca) =========
+INVISIBLE_CHARS = "\u200B\u200C\u200D\u2060\u2063"  # zero-width set
+
+def _strip_invisibles(s: str) -> str:
+    return s.translate({ord(c): None for c in INVISIBLE_CHARS})
+
+def _hide_token(token: str) -> str:
+    # Sembunyikan token agar tidak tampak di UI manusia, tapi tetap bisa dideteksi saat re-run
+    return f"\u2063{token}\u2063"
+
+def _handle_rate_limit(resp):
+    if resp.status_code == 429:
+        wait = int(resp.headers.get("Retry-After", "3"))
+        time.sleep(wait)
+        return True
+    return False
+
+def _get_with_pagination(url, headers, params=None):
+    params = params or {}
+    while True:
+        r = requests.get(url, headers=headers, params=params, timeout=45)
+        if _handle_rate_limit(r):
+            continue
+        r.raise_for_status()
+        data = r.json()
+        for item in data.get("data", []):
+            yield item
+        next_page = data.get("next_page")
+        if not next_page:
+            break
+        params = params.copy()
+        params["offset"] = next_page["offset"]
+
+# ========= TASK & SUBTASKS =========
+def list_project_tasks(project_gid, headers):
+    url = f"{BASE_URL}/projects/{project_gid}/tasks"
+    params = {"opt_fields": "name,completed,parent,permalink_url"}
+    return list(_get_with_pagination(url, headers, params))
+
+def list_subtasks(task_gid, headers):
+    url = f"{BASE_URL}/tasks/{task_gid}/subtasks"
+    params = {"opt_fields": "gid,name,completed,parent"}
+    return list(_get_with_pagination(url, headers, params))
+
+def expand_with_subtasks(tasks, headers):
+    all_tasks = []
+    stack = list(tasks)
+    while stack:
+        t = stack.pop()
+        all_tasks.append(t)
+        subs = list_subtasks(t["gid"], headers)
+        stack.extend(subs)
+    return all_tasks
+
+def filter_top_level(tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [t for t in tasks if not t.get("parent")]
+
+# ========= KOMENTAR =========
+def get_comments(task_gid, headers):
+    url = f"{BASE_URL}/tasks/{task_gid}/stories"
+    params = {"opt_fields": "gid,type,text,created_at,created_by.name"}
+    for s in _get_with_pagination(url, headers, params):
+        if s.get("type") == "comment":
+            yield s
+
+def post_comment(task_gid, text, headers):
+    url = f"{BASE_URL}/stories"
+    payload = {"data": {"target": task_gid, "text": text}}
+    while True:
+        r = requests.post(url, headers=headers, json=payload, timeout=45)
+        if _handle_rate_limit(r):
+            continue
+        r.raise_for_status()
+        return r.json()["data"]
+
+# ========= MODEL ATTACHMENT =========
+class AttachmentKind(str, Enum):
+    FILE = "file"
+    EXTERNAL_LINK = "external"
+    UNKNOWN = "unknown"
+
+@dataclass
+class AttachmentModel:
+    gid: str
+    name: str
+    kind: AttachmentKind
+    download_url: Optional[str]
+    size_bytes: Optional[int]
+    mime_type: Optional[str]
+    resource_subtype: Optional[str]
+    permanent_url: Optional[str] = None
+    view_url: Optional[str] = None
+
+    @property
+    def is_downloadable(self) -> bool:
+        return self.kind == AttachmentKind.FILE and bool(self.download_url)
+
+    @staticmethod
+    def sanitize_filename(name: str) -> str:
+        safe = "".join(c if c.isalnum() or c in " ._-()" else "_" for c in (name or "").strip())
+        if len(safe) > MAX_FILENAME_LEN:
+            root, ext = os.path.splitext(safe)
+            safe = root[: MAX_FILENAME_LEN - len(ext) - 1] + "_" + ext
+        return safe or "file.bin"
+
+    @classmethod
+    def from_raw(cls, raw: Dict[str, Any]) -> "AttachmentModel":
+        dl = raw.get("download_url")
+        name = raw.get("name") or (urlparse(dl).path.split("/")[-1] if dl else None) or f"{raw.get('gid','file')}.bin"
+        subtype = (raw.get("resource_subtype") or "").lower()
+        mime = raw.get("mime_type")
+        size_bytes = raw.get("size") or raw.get("size_bytes")
+        if dl:
+            kind = AttachmentKind.FILE
+        elif subtype in {"external", "gdrive", "dropbox", "onedrive", "box"}:
+            kind = AttachmentKind.EXTERNAL_LINK
+        else:
+            kind = AttachmentKind.UNKNOWN
+        return cls(
+            gid=str(raw.get("gid")),
+            name=cls.sanitize_filename(name),
+            kind=kind,
+            download_url=dl,
+            size_bytes=int(size_bytes) if isinstance(size_bytes, int) else (int(size_bytes) if (isinstance(size_bytes, str) and size_bytes.isdigit()) else None),
+            mime_type=mime,
+            resource_subtype=subtype,
+            permanent_url=raw.get("permanent_url"),
+            view_url=raw.get("view_url"),
+        )
+
+# ========= ATTACHMENTS: META / LIST / DL / UPLOAD / LINK =========
+ATT_OPT_FIELDS = "gid,name,download_url,permanent_url,view_url,resource_subtype,size,mime_type,host,created_at"
+
+def fetch_attachment_meta(att_gid: str, headers) -> Optional[AttachmentModel]:
+    try:
+        meta = requests.get(f"{BASE_URL}/attachments/{att_gid}",
+                            headers=headers,
+                            params={"opt_fields": ATT_OPT_FIELDS},
+                            timeout=45)
+        if meta.status_code == 404:
+            return None
+        meta.raise_for_status()
+        return AttachmentModel.from_raw(meta.json()["data"])
+    except Exception:
+        return None
+
+def list_attachments(task_gid, headers):
+    url = f"{BASE_URL}/tasks/{task_gid}/attachments"
+    models: List[AttachmentModel] = []
+    for raw in _get_with_pagination(url, headers):
+        m = fetch_attachment_meta(raw["gid"], headers)
+        if m:
+            models.append(m)
+    if models:
+        cnt_file = sum(1 for m in models if m.is_downloadable)
+        cnt_skip = len(models) - cnt_file
+        print(f"   • Attachment terdeteksi: {len(models)} | file: {cnt_file} | non-file/link: {cnt_skip}")
+    return models
+
+def head_content_length(url: str, headers: Optional[dict]) -> Optional[int]:
+    try:
+        r = requests.head(url, headers=headers, timeout=30, allow_redirects=True)
+        if r.status_code in RETRY_STATUS or r.status_code >= 500:
+            return None
+        if r.status_code == 405:
+            return None
+        r.raise_for_status()
+        cl = r.headers.get("Content-Length") or r.headers.get("content-length")
+        return int(cl) if cl and cl.isdigit() else None
+    except Exception:
+        return None
+
+def safe_download_attachment(model: AttachmentModel, headers_src: dict, dest_folder: str) -> Optional[str]:
+    if not model.is_downloadable or not model.download_url:
+        return None
+    os.makedirs(dest_folder, exist_ok=True)
+    out_path = os.path.join(dest_folder, model.name)
+    tries = 0
+    while tries < 5:
+        tries += 1
+        for with_header in (True, False):
+            try:
+                kw = dict(stream=True, timeout=DOWNLOAD_TIMEOUT)
+                resp = requests.get(model.download_url, headers=headers_src if with_header else None, **kw)
+                if resp.status_code in (401, 403, 404):
+                    fresh = fetch_attachment_meta(model.gid, headers_src)
+                    if fresh and fresh.download_url and fresh.download_url != model.download_url:
+                        model.download_url = fresh.download_url
+                        continue
+                if resp.status_code in RETRY_STATUS:
+                    time.sleep(min(2 * tries, 8))
+                    continue
+                resp.raise_for_status()
+                with open(out_path, "wb") as f:
+                    for part in resp.iter_content(chunk_size=CHUNK_SIZE):
+                        if part:
+                            f.write(part)
+                return out_path
+            except requests.RequestException:
+                time.sleep(min(2 * tries, 8))
+                continue
+            except Exception:
+                break
+    return None
+
+def attach_external_link(task_gid: str, name: str, url: str, headers_dest: dict) -> Optional[dict]:
+    api = f"{BASE_URL}/attachments"
+    data = {"parent": task_gid, "url": url, "name": name}
+    tries = 0
+    while tries < 3:
+        tries += 1
+        r = requests.post(api, headers=headers_dest, data=data, timeout=45)
+        if _handle_rate_limit(r) or r.status_code in RETRY_STATUS:
+            time.sleep(min(2 * tries, 6))
+            continue
+        if r.status_code == 400:
+            try:
+                print("[ERR] 400 saat attach URL:", r.json())
+            except Exception:
+                print("[ERR] 400 saat attach URL (raw):", r.text[:500])
+        try:
+            r.raise_for_status()
+            return r.json().get("data")
+        except requests.RequestException:
+            if tries >= 3:
+                return None
+            time.sleep(min(2 * tries, 6))
+    return None
+
+def upload_attachment(task_gid: str, file_path: str, headers_dest: dict) -> dict:
+    url = f"{BASE_URL}/tasks/{task_gid}/attachments"
+    tries = 0
+    while tries < 4:
+        tries += 1
+        try:
+            with open(file_path, "rb") as f:
+                files = {"file": (os.path.basename(file_path), f)}
+                r = requests.post(url, headers=headers_dest, files=files, timeout=UPLOAD_TIMEOUT)
+            if _handle_rate_limit(r) or r.status_code in RETRY_STATUS:
+                time.sleep(min(2 * tries, 6))
+                continue
+            if r.status_code == 400:
+                try:
+                    print("[ERR] 400 saat upload:", r.json())
+                except Exception:
+                    print("[ERR] 400 saat upload (raw):", r.text[:500])
+            r.raise_for_status()
+            return r.json()["data"]
+        except requests.RequestException as e:
+            if tries >= 4:
+                raise e
+            time.sleep(min(2 * tries, 6))
+
+# ========= DUPLICATE CHECK HELPERS =========
+def build_dest_comment_tokens(dst_task_gid: str) -> Set[str]:
+    tokens = set()
+    pat_new = re.compile(r"\[imported_from_story:(\d+)\]")
+    pat_old = re.compile(r"\[imported:story_gid=(\d+)\]")
+    for s in get_comments(dst_task_gid, H_B):
+        txt = _strip_invisibles(s.get("text") or "")
+        for m in pat_new.finditer(txt):
+            gid = m.group(1)
+            tokens.add(f"[imported_from_story:{gid}]")
+        for m in pat_old.finditer(txt):
+            gid = m.group(1)
+            tokens.add(f"[imported_from_story:{gid}]")
+    return tokens
+
+def extract_preferred_url(m: AttachmentModel) -> Optional[str]:
+    return m.permanent_url or m.view_url or m.download_url
+
+def build_dest_attachment_index(dst_task_gid: str) -> Tuple[Set[Tuple[str, int]], Set[Tuple[str, str]]]:
+    files_sig = set()
+    links_sig = set()
+    for m in list_attachments(dst_task_gid, H_B):
+        if m.is_downloadable:
+            if m.size_bytes is not None:
+                files_sig.add((m.name, int(m.size_bytes)))
+            else:
+                files_sig.add((m.name, -1))
+        else:
+            url = extract_preferred_url(m)
+            if url:
+                links_sig.add((m.name, url))
+    return files_sig, links_sig
+
+def is_probably_too_big(m: AttachmentModel) -> bool:
+    if m.size_bytes and m.size_bytes > SAFE_UPLOAD_THRESHOLD:
+        return True
+    if m.download_url:
+        cl = head_content_length(m.download_url, H_A)
+        if cl and cl > SAFE_UPLOAD_THRESHOLD:
+            return True
+    return False
+
+# ========= DEST SUBTASK CACHE & CREATE =========
+_dest_sub_cache: Dict[str, Dict[str, str]] = {}
+
+def _get_dest_subname_map(parent_dst_gid: str) -> Dict[str, str]:
+    if parent_dst_gid not in _dest_sub_cache:
+        subs = list_subtasks(parent_dst_gid, H_B)  # name, gid, completed
+        _dest_sub_cache[parent_dst_gid] = { (s.get("name") or ""): s["gid"] for s in subs }
+    return _dest_sub_cache[parent_dst_gid]
+
+def get_or_create_dst_subtask(parent_dst_gid: str, name: str) -> str:
+    name = name or ""
+    mp = _get_dest_subname_map(parent_dst_gid)
+    if name in mp:
+        return mp[name]
+    # create
+    url = f"{BASE_URL}/tasks"
+    payload = {"data": {"name": name, "parent": parent_dst_gid}}
+    r = requests.post(url, headers=H_B, json=payload, timeout=45)
+    if _handle_rate_limit(r):
+        return get_or_create_dst_subtask(parent_dst_gid, name)
+    r.raise_for_status()
+    gid = r.json()["data"]["gid"]
+    mp[name] = gid
+    return gid
+
+# ========= PROSES SALIN (IDEMPOTENT) =========
+completed_tasks_log: List[str] = []  # untuk log checklist
+
+def copy_comments_and_attachments(src_task_gid, dst_task_gid):
+    # --- Komentar: anti-duplikat & token tersembunyi ---
+    existing_tokens = build_dest_comment_tokens(dst_task_gid)
+
+    for c in get_comments(src_task_gid, H_A):
+        text = (c.get("text") or "").strip()
+        if not text:
+            continue
+        story_gid = c.get("gid")
+        token_plain = f"[imported_from_story:{story_gid}]"
+        if token_plain in existing_tokens:
+            continue
+
+        creator = (c.get("created_by", {}) or {}).get("name", "Unknown")
+        created_at = c.get("created_at", "")
+        human_footer = f"\n\n— Disalin dari tugas sumber (A) oleh {creator} pada {created_at}."
+        hidden = _hide_token(token_plain)
+
+        try:
+            post_comment(dst_task_gid, text + human_footer + hidden, H_B)
+            existing_tokens.add(token_plain)
+        except Exception as e:
+            print(f"[WARN] Gagal post comment {src_task_gid}->{dst_task_gid}: {e}")
+
+    # --- Attachment: anti-duplikat via signature ---
+    files_sig, links_sig = build_dest_attachment_index(dst_task_gid)
+    uploaded, linked, skipped = 0, 0, 0
+
+    for att_model in list_attachments(src_task_gid, H_A):
+        # dupe check
+        if att_model.is_downloadable:
+            sig = (att_model.name, int(att_model.size_bytes) if att_model.size_bytes is not None else -1)
+            if sig in files_sig:
+                continue
+        else:
+            url = extract_preferred_url(att_model)
+            if url and (att_model.name, url) in links_sig:
+                continue
+
+        # non-file → attach URL
+        if not att_model.is_downloadable:
+            pref = extract_preferred_url(att_model)
+            if not pref:
+                print(f"[INFO] Skip non-downloadable tanpa URL: {att_model.name} [{att_model.resource_subtype}]")
+                skipped += 1
+                continue
+            if attach_external_link(dst_task_gid, att_model.name, pref, H_B):
+                links_sig.add((att_model.name, pref))
+                linked += 1
+                print(f"[OK] Attached URL: {att_model.name} -> task {dst_task_gid}")
+            else:
+                print(f"[WARN] Gagal attach URL: {att_model.name}")
+            continue
+
+        # file besar → attach URL
+        if is_probably_too_big(att_model):
+            pref = extract_preferred_url(att_model)
+            if pref and attach_external_link(dst_task_gid, att_model.name, pref, H_B):
+                links_sig.add((att_model.name, pref))
+                linked += 1
+                print(f"[OK] Attached URL (besar>limit): {att_model.name} -> task {dst_task_gid}")
+            else:
+                print(f"[WARN] File terlalu besar & gagal attach URL: {att_model.name}")
+            continue
+
+        # unduh & upload
+        fp = safe_download_attachment(att_model, H_A, TMP_DIR)
+        if not fp:
+            print(f"[WARN] Gagal download: {att_model.name}")
+            continue
+
+        try:
+            try:
+                upload_attachment(dst_task_gid, fp, H_B)
+                files_sig.add((att_model.name, os.path.getsize(fp)))
+                uploaded += 1
+                print(f"[OK] Uploaded: {att_model.name} -> task {dst_task_gid}")
+            except requests.HTTPError as e:
+                msg = ""
+                try:
+                    msg = e.response.json()
+                except Exception:
+                    msg = e.response.text[:300] if hasattr(e, "response") and e.response is not None else str(e)
+                if "100MB" in str(msg) or "size" in str(msg).lower():
+                    pref = extract_preferred_url(att_model)
+                    if pref and attach_external_link(dst_task_gid, att_model.name, pref, H_B):
+                        links_sig.add((att_model.name, pref))
+                        linked += 1
+                        print(f"[OK] Fallback URL (size): {att_model.name} -> task {dst_task_gid}")
+                    else:
+                        print(f"[WARN] Fallback URL gagal: {att_model.name}")
+                else:
+                    print(f"[ERR] Upload gagal: {att_model.name}: {msg}")
+        finally:
+            try:
+                os.remove(fp)
+            except OSError:
+                pass
+
+    if uploaded or linked:
+        print(f"   • File ter-upload: {uploaded} | link terpasang: {linked} | di-skip: {skipped}")
+    else:
+        print("   • Tidak ada attachment baru untuk task ini.")
+
+def migrate_subtree(src_gid: str, dst_gid: str, path: str):
+    # 1) Copy komentar & attachment untuk node ini
+    copy_comments_and_attachments(src_gid, dst_gid)
+
+    # 2) Log checklist jika COMPLETED di sumber (hanya log, tidak ubah status tujuan)
+    for s in get_task_meta_cache(src_gid):
+        if s.get("completed"):
+            print(f"   [COMPLETE] {path}")
+            completed_tasks_log.append(path)
+        break  # meta unik
+
+    # 3) Rekursif untuk subtasks
+    src_subs = list_subtasks(src_gid, H_A)  # name, gid, completed
+    if not src_subs:
+        return
+    for sub in src_subs:
+        sub_name = sub.get("name") or ""
+        sub_gid = sub["gid"]
+        dst_sub_gid = get_or_create_dst_subtask(dst_gid, sub_name)
+        migrate_subtree(sub_gid, dst_sub_gid, f"{path} / {sub_name}")
+
+# ========= META CACHE SEDERHANA UNTUK STATUS =========
+_task_meta_cache_a: Dict[str, Dict[str, Any]] = {}
+def get_task_meta_cache(src_gid: str) -> List[Dict[str, Any]]:
+    meta = _task_meta_cache_a.get(src_gid)
+    if meta is not None:
+        return [meta]
+    url = f"{BASE_URL}/tasks/{src_gid}"
+    params = {"opt_fields": "gid,name,completed,parent"}
+    r = requests.get(url, headers=H_A, params=params, timeout=45)
+    if _handle_rate_limit(r):
+        return get_task_meta_cache(src_gid)
+    r.raise_for_status()
+    meta = r.json()["data"]
+    _task_meta_cache_a[src_gid] = meta
+    return [meta]
+
+# ========= PEMBANGUN PEMETAAN TASK LEVEL-ATAS =========
+def build_map_from_csv(csv_path):
+    mapping = {}
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            src = row.get("source_task_gid") or row.get("source")
+            dst = row.get("target_task_gid") or row.get("target")
+            if src and dst:
+                mapping[src] = dst
+    return mapping
+
+def map_by_exact_name(tasks_src, tasks_dst):
+    idx_dst = {t["name"]: t["gid"] for t in tasks_dst if t.get("name")}
+    mapping = {}
+    for s in tasks_src:
+        name = s.get("name")
+        if not name:
+            continue
+        gid = idx_dst.get(name)
+        if gid:
+            mapping[s["gid"]] = gid
+    return mapping
+
+def map_by_fuzzy_name(tasks_src, tasks_dst, cutoff=0.85):
+    names_dst = [t["name"] for t in tasks_dst if t.get("name")]
+    name2gid = {t["name"]: t["gid"] for t in tasks_dst if t.get("name")}
+    mapping = {}
+    for s in tasks_src:
+        name = s.get("name")
+        if not name:
+            continue
+        match = difflib.get_close_matches(name, names_dst, n=1, cutoff=cutoff)
+        if match:
+            mapping[s["gid"]] = name2gid[match[0]]
+    return mapping
+
+def build_mapping(tasks_src_top, tasks_dst_top):
+    if MAPPING_CSV and MATCH_MODE == "csv":
+        print(f"Bangun mapping dari CSV: {MAPPING_CSV}")
+        return build_map_from_csv(MAPPING_CSV)
+    elif MATCH_MODE == "exact":
+        print("Bangun mapping by EXACT name (top-level)...")
+        return map_by_exact_name(tasks_src_top, tasks_dst_top)
+    elif MATCH_MODE == "fuzzy":
+        print("Bangun mapping by FUZZY name (top-level)...")
+        return map_by_fuzzy_name(tasks_src_top, tasks_dst_top, cutoff=FUZZY_CUTOFF)
+    else:
+        raise ValueError("MATCH_MODE tidak dikenal. Gunakan: csv | exact | fuzzy")
+
+# ========= MAIN =========
+def main():
+    print("Mengambil tasks sumber (A) [top-level]...")
+    tasks_src_all = list_project_tasks(PROJECT_A, H_A)
+    tasks_src_top = filter_top_level(tasks_src_all)
+
+    print("Mengambil tasks target (B) [top-level]...")
+    tasks_dst_all = list_project_tasks(PROJECT_B, H_B)
+    tasks_dst_top = filter_top_level(tasks_dst_all)
+
+    print(f"Top-level task (A): {len(tasks_src_top)} | (B): {len(tasks_dst_top)}")
+
+    # siapkan meta cache untuk status completed sumber
+    global _task_meta_cache_a, completed_tasks_log
+    _task_meta_cache_a = {t["gid"]: {"gid": t["gid"], "name": t.get("name"), "completed": t.get("completed"), "parent": t.get("parent")} for t in tasks_src_all}
+    completed_tasks_log = []
+
+    # mapping (hanya top-level)
+    mapping = build_mapping(tasks_src_top, tasks_dst_top)
+
+    print(f"Total pasangan task top-level terpetakan: {len(mapping)}")
+    not_mapped = [t for t in tasks_src_top if t["gid"] not in mapping]
+    if not_mapped:
+        print(f"Peringatan: {len(not_mapped)} top-level task sumber belum terpeta. Contoh:")
+        for t in not_mapped[:10]:
+            print(" -", t.get("name"), t["gid"])
+
+    # migrasi per pasangan, termasuk subtask rekursif
+    for i, (src_gid, dst_gid) in enumerate(mapping.items(), 1):
+        src_name = _task_meta_cache_a.get(src_gid, {}).get("name") or "(tanpa nama)"
+        print(f"[{i}/{len(mapping)}] Migrasi subtree: {src_name} ({src_gid}) -> ({dst_gid})")
+        try:
+            # Bersihkan cache subtask tujuan per root agar fresh
+            _dest_sub_cache.clear()
+            migrate_subtree(src_gid, dst_gid, src_name)
+        except requests.HTTPError as e:
+            print(f"[ERR] HTTP error saat migrasi subtree {src_gid}->{dst_gid}: {e}")
+        except Exception as e:
+            print(f"[ERR] Error umum migrasi subtree {src_gid}->{dst_gid}: {e}")
+
+    # Ringkasan checklist task sumber completed
+    print("\n=== Checklist Task Sumber COMPLETED (log) ===")
+    if not completed_tasks_log:
+        print("(tidak ada)")
+    else:
+        for item in completed_tasks_log:
+            print(f"[x] {item}")
+
+    print("\nSelesai.")
+
+if __name__ == "__main__":
+    main()

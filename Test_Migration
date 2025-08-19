@@ -1,0 +1,720 @@
+import os
+import time
+import requests
+from tqdm import tqdm
+
+# =========================
+# KONFIGURASI
+# =========================
+SOURCE_TOKEN = os.getenv("ASANA_TOKEN_SRC", "2/1206278759530839/1211077736120079:2bed5ad552e10c3b312ace050e51e4a4")  # akun A (sumber/READ)
+DEST_TOKEN   = os.getenv("ASANA_TOKEN_DST", "2/1210982884256465/1211077996672430:48d2cc32de62818fb37e7dc315c86a54")  # akun B (tujuan/WRITE)
+
+OLD_PROJECT_ID   = "1208745780953128"  # project sumber (akun A)
+NEW_PROJECT_NAME = "SII24DL001 - Lesaffre: Man Power (Migration)"  # nama project baru (akun B)
+
+BASE_URL = "https://app.asana.com/api/1.0"
+ATTACHMENT_TEMP_FOLDER = "temp_attachments"
+
+HEADERS_SRC = {"Authorization": f"Bearer {SOURCE_TOKEN}"}
+HEADERS_DST = {"Authorization": f"Bearer {DEST_TOKEN}"}
+
+os.makedirs(ATTACHMENT_TEMP_FOLDER, exist_ok=True)
+
+# =========================
+# DESTINATION HELPERS (akun B)
+# =========================
+def get_workspaces_dst():
+    res = requests.get(f"{BASE_URL}/workspaces", headers=HEADERS_DST)
+    res.raise_for_status()
+    workspaces = res.json()["data"]
+    print("\n=== Daftar Workspace (TUJUAN) ===")
+    for idx, ws in enumerate(workspaces, 1):
+        print(f"{idx}. {ws['name']} ({ws['gid']})")
+    return workspaces
+
+def get_teams_dst(workspace_id):
+    res = requests.get(f"{BASE_URL}/organizations/{workspace_id}/teams", headers=HEADERS_DST)
+    if res.status_code != 200:
+        return []
+    teams = res.json()["data"]
+    if teams:
+        print("\n=== Daftar Team (TUJUAN) ===")
+        for idx, team in enumerate(teams, 1):
+            print(f"{idx}. {team['name']} ({team['gid']})")
+    return teams
+
+def create_project_dst(name, team_id=None, workspace_id=None):
+    payload = {"data": {"name": name}}
+    if team_id:
+        payload["data"]["team"] = team_id
+    elif workspace_id:
+        payload["data"]["workspace"] = workspace_id
+    res = requests.post(f"{BASE_URL}/projects", headers=HEADERS_DST, json=payload)
+    res.raise_for_status()
+    gid = res.json()["data"]["gid"]
+    print(f"📌 Project TUJUAN dibuat: {name} ({gid})")
+    return gid
+
+def create_section_dst(project_id, name):
+    res = requests.post(f"{BASE_URL}/projects/{project_id}/sections", headers=HEADERS_DST, data={"name": name})
+    res.raise_for_status()
+    return res.json()["data"]
+
+def add_task_to_section_dst(section_id, task_gid):
+    res = requests.post(
+        f"{BASE_URL}/sections/{section_id}/addTask",
+        headers=HEADERS_DST,
+        json={"data": {"task": task_gid}},
+    )
+    res.raise_for_status()
+
+def create_task_dst_minimal(project_id, name, notes=""):
+    payload = {"data": {"name": name or "", "notes": notes or "", "projects": [project_id]}}
+    res = requests.post(f"{BASE_URL}/tasks", headers=HEADERS_DST, json=payload)
+    if res.status_code == 400:
+        try: print("⚠️ Create minimal task 400:", res.json())
+        except Exception: print("⚠️ Create minimal task 400 raw:", res.text[:300])
+    res.raise_for_status()
+    return res.json()["data"]["gid"]
+
+def create_subtask_dst_minimal(parent_task_id, name, notes=""):
+    payload = {"data": {"name": name or "", "notes": notes or "", "parent": parent_task_id}}
+    res = requests.post(f"{BASE_URL}/tasks", headers=HEADERS_DST, json=payload)
+    if res.status_code == 400:
+        try: print(f"⚠️ Create minimal subtask 400 (parent {parent_task_id}):", res.json())
+        except Exception: print(f"⚠️ Create minimal subtask 400 raw (parent {parent_task_id}):", res.text[:300])
+    res.raise_for_status()
+    return res.json()["data"]["gid"]
+
+def update_task_fields_dst(task_id, fields_dict):
+    payload = {"data": fields_dict}
+    res = requests.put(f"{BASE_URL}/tasks/{task_id}", headers=HEADERS_DST, json=payload)
+    if res.status_code in (400,403):
+        try: print(f"⚠️ Patch task {task_id} {res.status_code}:", res.json())
+        except Exception: print(f"⚠️ Patch task {task_id} {res.status_code} raw:", res.text[:300])
+    res.raise_for_status()
+    return res.json().get("data", {})
+
+def add_comment_dst(task_id, text):
+    if not text or not text.strip():
+        return
+    for _ in range(3):
+        res = requests.post(
+            f"{BASE_URL}/tasks/{task_id}/stories",
+            headers=HEADERS_DST,
+            data={"text": text[:6000]},
+            timeout=30,
+        )
+        if res.status_code == 429:
+            time.sleep(2)
+            continue
+        res.raise_for_status()
+        return
+
+def upload_attachment_src_to_dst(dst_task_id, src_attachment):
+    att_id = src_attachment["gid"]
+    meta = requests.get(f"{BASE_URL}/attachments/{att_id}", headers=HEADERS_SRC)
+    meta.raise_for_status()
+    data = meta.json()["data"]
+    download_url = data["download_url"]
+    file_name = data["name"]
+    safe_name = "".join(c if c.isalnum() or c in "._- " else "_" for c in file_name)
+    path = os.path.join(ATTACHMENT_TEMP_FOLDER, safe_name)
+
+    with requests.get(download_url, stream=True) as r:
+        r.raise_for_status()
+        total_size = int(r.headers.get("content-length", 0) or 0)
+        with open(path, "wb") as f, tqdm(total=total_size, unit="B", unit_scale=True, desc=f"Downloading {safe_name}") as pbar:
+            for chunk in r.iter_content(8192):
+                if chunk:
+                    f.write(chunk)
+                    pbar.update(len(chunk))
+
+    with open(path, "rb") as f:
+        files = {"file": (safe_name, f)}
+        up = requests.post(f"{BASE_URL}/tasks/{dst_task_id}/attachments", headers=HEADERS_DST, files=files)
+        up.raise_for_status()
+    os.remove(path)
+
+def get_workspace_users_dst(workspace_id):
+    url = f"{BASE_URL}/workspaces/{workspace_id}/users"
+    params = {"opt_fields": "gid,name,email", "limit": 100}
+    users = []
+    while True:
+        res = requests.get(url, headers=HEADERS_DST, params=params)
+        res.raise_for_status()
+        payload = res.json()
+        users.extend(payload.get("data", []))
+        next_page = payload.get("next_page")
+        if not next_page or not next_page.get("offset"):
+            break
+        params["offset"] = next_page["offset"]
+    return users
+
+def build_user_map_dst(workspace_id):
+    user_map = {}
+    for u in get_workspace_users_dst(workspace_id):
+        email = (u.get("email") or "").strip().lower()
+        gid = u.get("gid")
+        if email and gid:
+            user_map[email] = gid
+    return user_map
+
+def debug_print_dst_custom_fields(workspace_id):
+    cfs = get_workspace_custom_fields_dst(workspace_id)
+    print(f"\n🧭 Custom Fields terdeteksi di workspace tujuan ({workspace_id}):")
+    for cf in cfs:
+        print(f" - {cf.get('name')} [{cf.get('type')}] gid={cf.get('gid')}")
+
+# =========================
+# SOURCE HELPERS (akun A)
+# =========================
+def get_sections_src(project_id):
+    res = requests.get(f"{BASE_URL}/projects/{project_id}/sections", headers=HEADERS_SRC)
+    res.raise_for_status()
+    return res.json().get("data", [])
+
+def get_tasks_in_section_src(section_id):
+    res = requests.get(f"{BASE_URL}/sections/{section_id}/tasks?opt_fields=gid,name", headers=HEADERS_SRC)
+    res.raise_for_status()
+    return res.json()["data"]
+
+def get_subtasks_src(task_id):
+    res = requests.get(f"{BASE_URL}/tasks/{task_id}/subtasks?opt_fields=gid,name", headers=HEADERS_SRC)
+    res.raise_for_status()
+    return res.json()["data"]
+
+def get_comments_src(task_id):
+    res = requests.get(f"{BASE_URL}/tasks/{task_id}/stories", headers=HEADERS_SRC)
+    res.raise_for_status()
+    return [c for c in res.json()["data"] if c["type"] == "comment"]
+
+def get_attachments_src(task_id):
+    res = requests.get(f"{BASE_URL}/tasks/{task_id}/attachments", headers=HEADERS_SRC)
+    res.raise_for_status()
+    return res.json()["data"]
+
+def get_task_detail_src(task_id):
+    params = {
+        "opt_fields": ",".join([
+            "name","notes",
+            "assignee.email","assignee.gid",
+            "custom_fields",
+            "custom_fields.gid","custom_fields.name","custom_fields.type","custom_fields.precision",
+            "custom_fields.text_value","custom_fields.number_value",
+            "custom_fields.date_value","custom_fields.date_value.date","custom_fields.date_value.date_time",
+            "custom_fields.enum_value.gid","custom_fields.enum_value.name",
+            "custom_fields.multi_enum_values.gid","custom_fields.multi_enum_values.name",
+            "custom_fields.people_value.gid","custom_fields.people_value.email"
+        ])
+    }
+    res = requests.get(f"{BASE_URL}/tasks/{task_id}", headers=HEADERS_SRC, params=params)
+    res.raise_for_status()
+    return res.json()["data"]
+
+# ==================================
+# CUSTOM FIELD HELPERS (SRC + DST)
+# ==================================
+def get_project_custom_field_settings_src(project_id):
+    url = f"{BASE_URL}/projects/{project_id}"
+    params = {
+        "opt_fields": ",".join([
+            "custom_field_settings",
+            "custom_field_settings.is_important",
+            "custom_field_settings.custom_field",
+            "custom_field_settings.custom_field.gid","custom_field_settings.custom_field.name",
+            "custom_field_settings.custom_field.type","custom_field_settings.custom_field.precision",
+            "custom_field_settings.custom_field.description",
+            "custom_field_settings.custom_field.enum_options",
+            "custom_field_settings.custom_field.enum_options.gid",
+            "custom_field_settings.custom_field.enum_options.name",
+            "custom_field_settings.custom_field.enum_options.color",
+            "custom_field_settings.custom_field.enum_options.enabled",
+        ])
+    }
+    res = requests.get(url, headers=HEADERS_SRC, params=params)
+    res.raise_for_status()
+    return res.json()["data"].get("custom_field_settings", [])
+
+def infer_cf_defs_from_tasks_src(old_project_id):
+    cf_defs = {}
+    sections = get_sections_src(old_project_id)
+    for sec in sections:
+        tasks = get_tasks_in_section_src(sec["gid"])
+        for t in tasks:
+            detail = get_task_detail_src(t["gid"])
+            for cf in (detail.get("custom_fields") or []):
+                gid = cf.get("gid")
+                if not gid:
+                    continue
+                entry = cf_defs.get(gid)
+                if not entry:
+                    entry = {
+                        "name": cf.get("name"),
+                        "type": cf.get("type"),
+                        "precision": cf.get("precision"),
+                        "description": None,
+                        "enum_options": []
+                    }
+                    cf_defs[gid] = entry
+                if cf.get("type") == "enum" and cf.get("enum_value"):
+                    nm = cf["enum_value"].get("name")
+                    if nm and not any(o["name"] == nm for o in entry["enum_options"]):
+                        entry["enum_options"].append({"name": nm, "color": "none", "enabled": True})
+                elif cf.get("type") == "multi_enum":
+                    for ev in (cf.get("multi_enum_values") or []):
+                        nm = ev.get("name")
+                        if nm and not any(o["name"] == nm for o in entry["enum_options"]):
+                            entry["enum_options"].append({"name": nm, "color": "none", "enabled": True})
+    return cf_defs
+
+def get_workspace_custom_fields_dst(workspace_id):
+    url = f"{BASE_URL}/workspaces/{workspace_id}/custom_fields"
+    params = {
+        "opt_fields": ",".join([
+            "gid","name","type","precision","description",
+            "enum_options","enum_options.gid","enum_options.name","enum_options.color","enum_options.enabled"
+        ]),
+        "limit": 100
+    }
+    out = []
+    while True:
+        res = requests.get(url, headers=HEADERS_DST, params=params)
+        res.raise_for_status()
+        out.extend(res.json().get("data", []))
+        next_page = res.json().get("next_page")
+        if not next_page or not next_page.get("offset"):
+            break
+        params["offset"] = next_page["offset"]
+    return out
+
+def add_custom_field_to_project_dst(project_id, custom_field_gid, is_important=False):
+    url = f"{BASE_URL}/projects/{project_id}/addCustomFieldSetting"
+    data = {"data": {"custom_field": custom_field_gid, "is_important": is_important}}
+    res = requests.post(url, headers=HEADERS_DST, json=data)
+    if res.status_code in (400, 409):
+        return res.json().get("data")
+    if res.status_code == 403:
+        try: detail = res.json()
+        except Exception: detail = {"raw": res.text[:300]}
+        print(f"⚠️ (403) Tidak punya izin menambah CF {custom_field_gid} ke project. Lanjut tanpa field ini. Detail: {detail}")
+        return None
+    res.raise_for_status()
+    return res.json().get("data")
+
+def ensure_field_attached(project_id, cf_gid):
+    try:
+        check = requests.get(
+            f"{BASE_URL}/projects/{project_id}",
+            headers=HEADERS_DST,
+            params={"opt_fields": "custom_field_settings.custom_field.gid"}
+        )
+        check.raise_for_status()
+        attached = {s["custom_field"]["gid"] for s in check.json()["data"].get("custom_field_settings", [])}
+        if cf_gid not in attached:
+            print(f"⚠️ Field {cf_gid} belum tertaut ke project {project_id} – nilai tidak akan bisa diset.")
+    except Exception:
+        pass
+
+def _is_similar_cf(cf_existing, cf_def):
+    if cf_existing.get("type") != cf_def.get("type"):
+        return False
+    if cf_def.get("type") == "number":
+        if cf_existing.get("precision") != cf_def.get("precision"):
+            return False
+    if cf_def.get("type") in ("enum","multi_enum"):
+        ex_names = {o.get("name") for o in (cf_existing.get("enum_options") or []) if o.get("name")}
+        src_names = {o.get("name") for o in (cf_def.get("enum_options") or []) if o.get("name")}
+        if src_names:
+            overlap = len(ex_names & src_names) / max(1, len(src_names))
+            if overlap < 0.8:
+                return False
+    return True
+
+def create_custom_field_in_workspace_dst(workspace_id, cf_def, existing_cf_cache=None):
+    if existing_cf_cache is None:
+        existing_cf_cache = get_workspace_custom_fields_dst(workspace_id)
+
+    def find_existing():
+        for cf in existing_cf_cache:
+            if cf.get("name") == cf_def.get("name") and _is_similar_cf(cf, cf_def):
+                return cf
+        return None
+
+    url = f"{BASE_URL}/custom_fields"
+    data = {"data": {"workspace": workspace_id, "name": cf_def.get("name"), "type": cf_def.get("type")}}
+    if cf_def.get("description"):
+        data["data"]["description"] = cf_def["description"]
+    if cf_def.get("type") == "number" and cf_def.get("precision") is not None:
+        data["data"]["precision"] = cf_def["precision"]
+    if cf_def.get("type") in ("enum", "multi_enum"):
+        opts = cf_def.get("enum_options") or []
+        if opts:
+            data["data"]["enum_options"] = [
+                {"name": o["name"], "color": o.get("color", "none"), "enabled": o.get("enabled", True)} for o in opts
+            ]
+
+    res = requests.post(url, headers=HEADERS_DST, json=data)
+
+    if res.status_code in (402, 403):
+        try: detail = res.json()
+        except Exception: detail = {"raw": res.text[:300]}
+        print(f"ℹ️ ({res.status_code}) Tidak bisa membuat CF. Coba pakai eksisting '{cf_def.get('name')}'. Detail: {detail}")
+        exist = find_existing()
+        if exist:
+            return exist
+        print("⏭️ Tidak ada CF eksisting yang cocok. Buat manual via UI / upgrade izin. Field ini akan diskip.")
+        return None
+
+    res.raise_for_status()
+    return res.json()["data"]
+
+def ensure_enum_options_exist(new_cf_gid, option_names):
+    r = requests.get(f"{BASE_URL}/custom_fields/{new_cf_gid}",
+                     headers=HEADERS_DST,
+                     params={"opt_fields":"enum_options.gid,enum_options.name"})
+    r.raise_for_status()
+    existing = {o["name"]: o["gid"] for o in (r.json()["data"].get("enum_options") or [])}
+
+    need = [name for name in option_names if name and name not in existing]
+    for name in need:
+        rr = requests.post(f"{BASE_URL}/custom_fields/{new_cf_gid}/enum_options",
+                           headers=HEADERS_DST,
+                           json={"data": {"name": name}})
+        if rr.status_code in (200,201):
+            gid = rr.json()["data"]["gid"]
+            existing[name] = gid
+        else:
+            try: print("⚠️ Gagal membuat enum option", name, rr.json())
+            except Exception: print("⚠️ Gagal membuat enum option", name, rr.text[:200])
+    return existing
+
+def build_custom_field_mapping_src_to_dst(old_project_id, new_project_id, workspace_id_dst):
+    try:
+        cfs = get_project_custom_field_settings_src(old_project_id)
+    except requests.HTTPError as e:
+        print(f"⚠️ Gagal baca custom_field_settings project sumber: {e}. Pakai fallback infer dari task.")
+        cfs = []
+
+    if not cfs:
+        inferred = infer_cf_defs_from_tasks_src(old_project_id)
+        cfs = []
+        for old_cf_gid, defn in inferred.items():
+            cfs.append({
+                "is_important": False,
+                "custom_field": {
+                    "gid": old_cf_gid,
+                    "name": defn.get("name"),
+                    "type": defn.get("type"),
+                    "precision": defn.get("precision"),
+                    "description": defn.get("description"),
+                    "enum_options": defn.get("enum_options") or []
+                }
+            })
+        if not cfs:
+            print("ℹ️ Tidak ada custom field terdeteksi di project sumber.")
+            return {}, {}, {}
+
+    project_cf_map = {}
+    enum_option_map = {}
+    existing_cf_cache = get_workspace_custom_fields_dst(workspace_id_dst)
+
+    for cfs_item in cfs:
+        cf = cfs_item.get("custom_field")
+        if not cf:
+            continue
+
+        cf_def = {
+            "name": cf.get("name"),
+            "type": cf.get("type"),
+            "precision": cf.get("precision"),
+            "description": cf.get("description"),
+            "enum_options": cf.get("enum_options") or [],
+        }
+
+        new_cf = create_custom_field_in_workspace_dst(workspace_id_dst, cf_def, existing_cf_cache=existing_cf_cache)
+        if not new_cf:
+            print(f"⏭️ Skip CF: {cf_def.get('name')} ({cf_def.get('type')})")
+            continue
+
+        new_cf_gid = new_cf["gid"]
+
+        # attach
+        is_important = cfs_item.get("is_important", False)
+        try:
+            add_custom_field_to_project_dst(new_project_id, new_cf_gid, is_important=is_important)
+        finally:
+            ensure_field_attached(new_project_id, new_cf_gid)
+
+        # enum: pastikan opsi minimal sama
+        if cf.get("type") in ("enum","multi_enum"):
+            names = [o["name"] for o in (cf.get("enum_options") or []) if o.get("name")]
+            name_to_gid = ensure_enum_options_exist(new_cf_gid, names)
+            # map old enum gid -> new enum gid berdasarkan nama
+            old_to_new_opts = {}
+            for old_opt in (cf.get("enum_options") or []):
+                nm = old_opt.get("name")
+                if nm in name_to_gid:
+                    old_to_new_opts[old_opt["gid"]] = name_to_gid[nm]
+            if old_to_new_opts:
+                enum_option_map[cf["gid"]] = old_to_new_opts
+
+        project_cf_map[cf["gid"]] = new_cf_gid
+
+    return project_cf_map, enum_option_map, existing_cf_cache
+
+def map_task_custom_field_values(old_cf_values, project_cf_map, enum_option_map, user_map_dst):
+    """
+    Return:
+      cf_values: {new_cf_gid: value}
+      missing: {new_cf_gid: set([enum_name,...])}
+    """
+    new_values = {}
+    missing_enum_by_new_cf = {}
+
+    for cf in (old_cf_values or []):
+        old_cf_id = cf.get("gid")
+        if not old_cf_id:
+            continue
+        new_cf_id = project_cf_map.get(old_cf_id)
+        if not new_cf_id:
+            continue
+
+        t = cf.get("type")
+        if t == "text":
+            if cf.get("text_value"):
+                new_values[new_cf_id] = cf["text_value"]
+        elif t == "number":
+            if cf.get("number_value") is not None:
+                new_values[new_cf_id] = cf["number_value"]
+        elif t == "date":
+            dv = cf.get("date_value")
+            if dv:
+                new_values[new_cf_id] = dv.get("date") or (dv.get("date_time") or "")[:10]
+        elif t == "people":
+            pv = cf.get("people_value")
+            if pv and isinstance(pv, dict):
+                em = (pv.get("email") or "").strip().lower()
+                if em and user_map_dst:
+                    gid = user_map_dst.get(em)
+                    if gid:
+                        new_values[new_cf_id] = gid
+        elif t == "enum":
+            old_enum = cf.get("enum_value")
+            if old_enum:
+                mapped = enum_option_map.get(old_cf_id, {}).get(old_enum.get("gid"))
+                if mapped:
+                    new_values[new_cf_id] = mapped
+                else:
+                    nm = old_enum.get("name")
+                    if nm:
+                        missing_enum_by_new_cf.setdefault(new_cf_id, set()).add(nm)
+        elif t == "multi_enum":
+            mapped_list = []
+            missing = set()
+            for item in (cf.get("multi_enum_values") or []):
+                gid = enum_option_map.get(old_cf_id, {}).get(item.get("gid"))
+                if gid:
+                    mapped_list.append(gid)
+                else:
+                    nm = item.get("name")
+                    if nm:
+                        missing.add(nm)
+            if mapped_list:
+                new_values[new_cf_id] = mapped_list
+            if missing:
+                missing_enum_by_new_cf.setdefault(new_cf_id, set()).update(missing)
+
+    return new_values, missing_enum_by_new_cf
+
+# =====================
+# MIGRASI BY SECTIONS & TASKS
+# =====================
+def migrate_sections(old_project_id, new_project_id):
+    old_sections = get_sections_src(old_project_id)
+    mapping = {}
+    for sec in old_sections:
+        new_sec = create_section_dst(new_project_id, sec["name"])
+        mapping[sec["gid"]] = new_sec["gid"]
+        print(f"✅ Section '{sec['name']}' dibuat di project tujuan")
+    return mapping
+
+def copy_task_recursive(old_task_id, new_project_id, section_id=None,
+                        project_cf_map=None, enum_option_map=None,
+                        user_map_dst=None, unmapped_emails=None,
+                        parent_new_task_id=None):
+    old_task = get_task_detail_src(old_task_id)
+    name  = old_task.get("name") or ""
+    notes = old_task.get("notes") or ""
+
+    # 1) Buat task minimal
+    if parent_new_task_id:
+        new_task_id = create_subtask_dst_minimal(parent_new_task_id, name, notes)
+    else:
+        new_task_id = create_task_dst_minimal(new_project_id, name, notes)
+        if section_id:
+            try:
+                add_task_to_section_dst(section_id, new_task_id)
+            except requests.HTTPError as e:
+                print(f"⚠️ Gagal addTask ke section {section_id} untuk task {new_task_id}: {e}")
+
+    # 2) Assignee
+    if user_map_dst is not None:
+        assignee = old_task.get("assignee") or {}
+        email = (assignee.get("email") or "").strip().lower()
+        if email:
+            mapped_gid = user_map_dst.get(email)
+            if mapped_gid:
+                try:
+                    update_task_fields_dst(new_task_id, {"assignee": mapped_gid})
+                except requests.HTTPError:
+                    if unmapped_emails is not None:
+                        unmapped_emails.add(email)
+            else:
+                if unmapped_emails is not None:
+                    unmapped_emails.add(email)
+
+    # 3) Custom fields (set dulu yg sudah siap, lalu buat enum yang kurang & set ulang)
+    if project_cf_map:
+        cf_values, missing = map_task_custom_field_values(
+            old_task.get("custom_fields"),
+            project_cf_map,
+            enum_option_map or {},
+            user_map_dst
+        )
+
+        if cf_values:
+            try:
+                update_task_fields_dst(new_task_id, {"custom_fields": cf_values})
+            except requests.HTTPError:
+                print(f"⚠️ custom_fields (fase-1) gagal untuk task {new_task_id}")
+
+        # buat enum option yang belum ada, lalu isi ulang hanya field itu
+        for new_cf_id, names in (missing or {}).items():
+            if not names:
+                continue
+            created = ensure_enum_options_exist(new_cf_id, sorted([n for n in names if n]))
+            # set ulang untuk field ini
+            for cf in (old_task.get("custom_fields") or []):
+                if project_cf_map.get(cf.get("gid")) != new_cf_id:
+                    continue
+                if cf.get("type") == "enum" and cf.get("enum_value"):
+                    nm = cf["enum_value"].get("name")
+                    gid = created.get(nm)
+                    if gid:
+                        try:
+                            update_task_fields_dst(new_task_id, {"custom_fields": {new_cf_id: gid}})
+                        except requests.HTTPError:
+                            pass
+                elif cf.get("type") == "multi_enum":
+                    target = []
+                    for it in (cf.get("multi_enum_values") or []):
+                        gid = created.get(it.get("name"))
+                        if gid:
+                            target.append(gid)
+                    if target:
+                        try:
+                            update_task_fields_dst(new_task_id, {"custom_fields": {new_cf_id: target}})
+                        except requests.HTTPError:
+                            pass
+
+    # 4) Comments
+    for c in get_comments_src(old_task_id):
+        add_comment_dst(new_task_id, c.get("text"))
+
+    # 5) Attachments
+    for att in get_attachments_src(old_task_id):
+        upload_attachment_src_to_dst(new_task_id, att)
+
+    # 6) Subtasks
+    for sub in get_subtasks_src(old_task_id):
+        copy_task_recursive(
+            sub["gid"], new_project_id, section_id,
+            project_cf_map, enum_option_map,
+            user_map_dst, unmapped_emails,
+            parent_new_task_id=new_task_id
+        )
+
+def copy_tasks(old_project_id, new_project_id, project_cf_map=None, enum_option_map=None,
+               user_map_dst=None, unmapped_emails=None):
+    old_sections = get_sections_src(old_project_id)
+    section_mapping = migrate_sections(old_project_id, new_project_id)
+
+    for sec in old_sections:
+        tasks = get_tasks_in_section_src(sec["gid"])
+        for t in tasks:
+            copy_task_recursive(
+                t["gid"],
+                new_project_id,
+                section_id=section_mapping.get(sec["gid"]),
+                project_cf_map=project_cf_map,
+                enum_option_map=enum_option_map,
+                user_map_dst=user_map_dst,
+                unmapped_emails=unmapped_emails,
+            )
+
+# ========== MAIN ==========
+def migrate():
+    # Pilih workspace/teams TUJUAN (akun B)
+    workspaces = get_workspaces_dst()
+    while True:
+        try:
+            ws_choice = int(input("Pilih workspace TUJUAN (nomor): ")) - 1
+            if 0 <= ws_choice < len(workspaces):
+                workspace_id_dst = workspaces[ws_choice]["gid"]
+                break
+            else:
+                print("❌ Nomor workspace tidak valid")
+        except ValueError:
+            print("❌ Masukkan angka yang benar")
+
+    teams = get_teams_dst(workspace_id_dst)
+    if teams:
+        while True:
+            try:
+                team_choice = int(input("Pilih team TUJUAN (nomor): ")) - 1
+                if 0 <= team_choice < len(teams):
+                    team_id_dst = teams[team_choice]["gid"]
+                    break
+                else:
+                    print("❌ Nomor team tidak valid")
+            except ValueError:
+                print("❌ Masukkan angka yang benar")
+    else:
+        team_id_dst = None
+        print("ℹ Workspace bukan organization atau tidak ada team. Project akan dibuat langsung di workspace.")
+
+    # (Opsional) lihat semua CF yang terlihat oleh token di workspace tujuan
+    debug_print_dst_custom_fields(workspace_id_dst)
+
+    # Buat project tujuan
+    new_project_id = create_project_dst(NEW_PROJECT_NAME, team_id=team_id_dst, workspace_id=workspace_id_dst)
+
+    # Siapkan custom fields di TUJUAN (buat/attach + sinkron opsi enum)
+    print("\n🧩 Menyiapkan custom fields di workspace & project tujuan...")
+    project_cf_map, enum_option_map, _ = build_custom_field_mapping_src_to_dst(
+        OLD_PROJECT_ID, new_project_id, workspace_id_dst
+    )
+
+    # Siapkan user map untuk assignee & people CF
+    print("\n👤 Menyiapkan pemetaan user (email → user GID di workspace tujuan)...")
+    user_map_dst = build_user_map_dst(workspace_id_dst)
+    unmapped_emails = set()
+
+    # Migrasi tasks
+    print("\n📂 Migrasi task, subtask, comment, attachment, custom fields, dan assignee...")
+    copy_tasks(OLD_PROJECT_ID, new_project_id,
+               project_cf_map=project_cf_map,
+               enum_option_map=enum_option_map,
+               user_map_dst=user_map_dst,
+               unmapped_emails=unmapped_emails)
+
+    if unmapped_emails:
+        print("\n⚠️ Email berikut tidak ditemukan di workspace tujuan (lewati set assignee/people CF):")
+        for e in sorted(unmapped_emails):
+            print(" -", e)
+
+    print("\n✅ Migrasi selesai! Custom field seharusnya mengikuti akun A.")
+
+if __name__ == "__main__":
+    migrate()
